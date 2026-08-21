@@ -11,7 +11,8 @@
 - 地址策略：精准 IPv6 named set；或低 64 位 IID 掩码规则。
 - 端口策略：TCP、UDP、TCP+UDP；单端口及端口段。
 - 隔离：UCI section、nft set 和 comment 均使用 `ddns_fw_` / `ddns-fw:` 前缀。
-- LuCI：状态概览、规则设备、Webhook 接入、审计日志四个独立页面，可在多个浏览器窗口同时打开。
+- LuCI：状态概览、规则设备、Webhook 接入、审计日志四个独立页面，可在多个浏览器窗口同时打开；规则支持编辑、删除，概览页适配深色主题。
+- 主动监听频率：LuCI 可选 5 / 10 / 15 / 30 / 60 / 120 / 300 秒，默认 30 秒；Webhook 推送仍可立即触发同步。
 
 ## 一键构建和安装
 
@@ -21,13 +22,13 @@ Windows PowerShell：
 .\run.ps1 -Router 192.168.10.33 -Password '你的 root 密码'
 ```
 
-如果只需要给路由器一个文件，使用 `dist/ddns-fw-0.1.0.run`。它是自包含安装器，不依赖源码或 PowerShell：
+如果只需要给路由器一个文件，使用 `dist/ddns-fw.run`。它是自包含安装器，不依赖源码或 PowerShell：
 
 ```sh
-chmod +x ddns-fw-0.1.0.run
-./ddns-fw-0.1.0.run
-./ddns-fw-0.1.0.run --check
-./ddns-fw-0.1.0.run --uninstall
+chmod +x ddns-fw.run
+./ddns-fw.run
+./ddns-fw.run --check
+./ddns-fw.run --uninstall
 ```
 
 可通过 LuCI 文件传输、SCP 或 U 盘复制到 `/tmp` 后执行。安装器会自动备份 `/etc/config/firewall` 到 `/tmp/ddns-fw-backup/`。
@@ -60,7 +61,7 @@ curl -X POST 'http://192.168.10.1:9080/api/firewall/sync' \
   }'
 ```
 
-Token 可在 LuCI 的“网络 → DDNS IPv6 防火墙 → Webhook / 接入”或“服务 → DDNS IPv6 防火墙 → Webhook / 接入”查看或修改。默认监听 `9080`；uhttpd 本身不创建 WAN 入站放行规则，若需要公网调用，请仅向可信来源开放该端口，推荐再叠加 VPN 或反向代理 TLS。升级插件后如果菜单暂时不出现，请退出 LuCI、按 `Ctrl+F5` 强制刷新一次。
+Token 和主动监听频率可在 LuCI 的“网络 → DDNS IPv6 防火墙 → Webhook / 接入”或“服务 → DDNS IPv6 防火墙 → Webhook / 接入”查看或修改。默认监听 `9080`、轮询 `30` 秒；uhttpd 本身不创建 WAN 入站放行规则，若需要公网调用，请仅向可信来源开放该端口，推荐再叠加 VPN 或反向代理 TLS。升级插件后如果菜单暂时不出现，请退出 LuCI、按 `Ctrl+F5` 强制刷新一次。
 
 ## 配置模型
 
