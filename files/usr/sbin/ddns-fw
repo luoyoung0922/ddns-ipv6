@@ -1,0 +1,636 @@
+#!/bin/sh
+
+RUN_DIR=/var/run/ddns-fw
+WEBHOOK_DIR=$RUN_DIR/webhooks
+LOG_FILE=/var/log/ddns-fw.log
+SNAPSHOT=$RUN_DIR/snapshot.tsv
+PREFIX=ddns_fw_
+
+mkdir -p "$RUN_DIR" "$WEBHOOK_DIR" /var/log
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+json_quote() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r/\\r/g; s/\t/\\t/g'
+}
+
+log_msg() {
+	local level="$1"; shift
+	local message="$*" size
+	size="$(wc -c < "$LOG_FILE" 2>/dev/null)"
+	if [ "${size:-0}" -ge 131072 ]; then
+		tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+	fi
+	printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$message" >> "$LOG_FILE"
+	logger -t ddns-fw -p "daemon.${level}" -- "$message" 2>/dev/null || true
+}
+
+cfg_load() {
+	config_load ddns_fw
+	config_get_bool CFG_ENABLED main enabled 1
+	config_get CFG_BACKEND main backend auto
+	config_get CFG_LAN main lan_interface lan
+	config_get CFG_WAN main wan_interface wan6
+	config_get_bool CFG_PAYLOAD_PORTS main allow_payload_ports 1
+}
+
+backend() {
+	cfg_load
+	case "$CFG_BACKEND" in
+		nft) command -v fw4 >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 && echo nft || echo uci ;;
+		uci) echo uci ;;
+		*) command -v fw4 >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 && echo nft || echo uci ;;
+	esac
+}
+
+safe_id() {
+	printf '%s' "$1" | md5sum | cut -c1-12
+}
+
+valid_client() {
+	[ -n "$1" ] && [ "${#1}" -le 64 ] && ! printf '%s' "$1" | grep -q '[^A-Za-z0-9_.-]'
+}
+
+valid_ipv6() {
+	[ -n "$1" ] || return 1
+	[ "${#1}" -le 64 ] || return 1
+	printf '%s' "$1" | grep -q ':' || return 1
+	printf '%s' "$1" | grep -q '[^0-9A-Fa-f:.%]' && return 1
+	ip -6 route get "${1%%%*}" >/dev/null 2>&1
+}
+
+is_global_ipv6() {
+	case "$1" in 2*|3*) return 0;; *) return 1;; esac
+}
+
+normalize_ports() {
+	local raw="$1" item first last out=""
+	raw="$(printf '%s' "$raw" | tr ',\n\t' '   ')"
+	for item in $raw; do
+		case "$item" in
+			*[!0-9-]*|*-*-*|-*|*-) return 1 ;;
+			*-*)
+				first="${item%-*}"; last="${item#*-}"
+				[ "$first" -ge 1 ] 2>/dev/null && [ "$last" -le 65535 ] 2>/dev/null && [ "$first" -le "$last" ] 2>/dev/null || return 1
+				item="$first-$last"
+				;;
+			*) [ "$item" -ge 1 ] 2>/dev/null && [ "$item" -le 65535 ] 2>/dev/null || return 1 ;;
+		esac
+		case " $out " in *" $item "*) :;; *) out="${out}${out:+ }$item";; esac
+	done
+	[ -n "$out" ] || return 1
+	printf '%s\n' "$out"
+}
+
+normalize_proto() {
+	case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+		tcp) echo tcp;;
+		udp) echo udp;;
+		tcpudp|tcp+udp|both|'tcp udp'|'udp tcp') echo tcpudp;;
+		*) return 1;;
+	esac
+}
+
+ipv6_iid() {
+	printf '%s\n' "${1%%%*}" | awk '
+	function groups(s,a, n) { if (s == "") return 0; n=split(s,a,":"); return n }
+	{
+		a=$0; sub(/\/.*/,"",a)
+		if (index(a,"::")) {
+			split(a,z,"::"); nl=groups(z[1],l); nr=groups(z[2],r); miss=8-nl-nr
+			k=0; for(i=1;i<=nl;i++) g[++k]=l[i]; for(i=1;i<=miss;i++) g[++k]="0"; for(i=1;i<=nr;i++) g[++k]=r[i]
+		} else { k=split(a,g,":") }
+		if (k != 8) exit 1
+		printf "::%s:%s:%s:%s\n", g[5],g[6],g[7],g[8]
+	}'
+}
+
+ipv6_prefix4() {
+	printf '%s\n' "${1%%%*}" | awk '
+	function groups(s,a,n){if(s=="")return 0;n=split(s,a,":");return n}
+	{
+		a=$0; sub(/\/.*/,"",a)
+		if(index(a,"::")){split(a,z,"::");nl=groups(z[1],l);nr=groups(z[2],r);miss=8-nl-nr;k=0;for(i=1;i<=nl;i++)g[++k]=l[i];for(i=1;i<=miss;i++)g[++k]="0";for(i=1;i<=nr;i++)g[++k]=r[i]}
+		else{k=split(a,g,":")}
+		if(k!=8)exit 1
+		printf "%s:%s:%s:%s\n",g[1],g[2],g[3],g[4]
+	}'
+}
+
+ipv6_tail4() {
+	local iid="$(ipv6_iid "$1")"
+	printf '%s\n' "${iid#::}"
+}
+
+rebase_ipv6() {
+	local old="$1" prefix="$2" old_prefix new_prefix tail
+	old_prefix="$(ipv6_prefix4 "$old" 2>/dev/null)"
+	new_prefix="$(ipv6_prefix4 "$prefix" 2>/dev/null)"
+	tail="$(ipv6_tail4 "$old" 2>/dev/null)"
+	[ -n "$old_prefix" ] && [ -n "$new_prefix" ] && [ -n "$tail" ] || { printf '%s\n' "$old"; return 0; }
+	[ "$old_prefix" = "$new_prefix" ] || printf '%s:%s\n' "$new_prefix" "$tail"
+	[ "$old_prefix" = "$new_prefix" ] && printf '%s\n' "$old"
+}
+
+lan_device() {
+	local out
+	out="$(ubus call "network.interface.$CFG_LAN" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	[ -n "$out" ] || out="$(ubus call "network.interface.$CFG_LAN" status 2>/dev/null | jsonfilter -e '@.device' 2>/dev/null)"
+	printf '%s\n' "${out:-br-lan}"
+}
+
+wan_prefix() {
+	local data value mask dev
+	data="$(ubus call "network.interface.$CFG_WAN" status 2>/dev/null)"
+	value="$(jsonfilter -s "$data" -e '@["ipv6-prefix"][0].address' 2>/dev/null)"
+	mask="$(jsonfilter -s "$data" -e '@["ipv6-prefix"][0].mask' 2>/dev/null)"
+	[ -n "$value" ] && [ -n "$mask" ] && value="$value/$mask"
+	[ -n "$value" ] || value="$(jsonfilter -s "$data" -e '@["ipv6-address"][0].address' 2>/dev/null)"
+	if [ -z "$value" ]; then
+		data="$(ubus call "network.interface.$CFG_LAN" status 2>/dev/null)"
+		value="$(jsonfilter -s "$data" -e '@["ipv6-prefix-assignment"][0].address' 2>/dev/null)"
+	fi
+	if [ -z "$value" ]; then
+		dev="$(lan_device)"
+		value="$(ip -6 addr show dev "$dev" scope global 2>/dev/null | awk '$1=="inet6" && $2 ~ /^[23]/ { print $2; exit }')"
+	fi
+	printf '%s\n' "$value"
+}
+
+wan_device() {
+	local out
+	out="$(ubus call "network.interface.$CFG_WAN" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	[ -n "$out" ] || out="$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	printf '%s\n' "$out"
+}
+
+resolve_mac() {
+	local want dev
+	want="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+	dev="$(lan_device)"
+	ip -6 neigh show dev "$dev" 2>/dev/null | awk -v m="$want" '
+	BEGIN { IGNORECASE=1 }
+	$1 ~ /^[23]/ && $0 ~ "lladdr[[:space:]]+" m "([[:space:]]|$)" && $0 !~ /FAILED/ { print $1; exit }'
+}
+
+resolve_duid() {
+	local want
+	want="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+	[ -r /tmp/odhcpd.leases ] || return 0
+	awk -v d="$want" '
+	BEGIN { IGNORECASE=1 }
+	tolower($0) ~ d { for(i=1;i<=NF;i++) if ($i ~ /^[23][0-9a-fA-F:]+$/) { print $i; exit } }' /tmp/odhcpd.leases
+}
+
+resolve_hostname() {
+	local want
+	want="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+	[ -r /tmp/hosts/odhcpd ] || return 0
+	awk -v h="$want" '
+	BEGIN { IGNORECASE=1 }
+	$1 ~ /^[23]/ { for(i=2;i<=NF;i++) if (tolower($i)==h || tolower($i)==h ".lan") { print $1; exit } }' /tmp/hosts/odhcpd
+}
+
+webhook_lookup() {
+	local file="$WEBHOOK_DIR/$(safe_id "$1").tsv"
+	[ -r "$file" ] && sed -n '1p' "$file"
+}
+
+port_nft() {
+	printf '%s' "$1" | sed 's/ /, /g'
+}
+
+emit_rule() {
+	local key="$1" name="$2" source="$3" strategy="$4" ip="$5" proto="$6" ports="$7"
+	local id setname port_expr match status iid
+	id="$(safe_id "$key")"
+	setname="${PREFIX}${id}"
+	port_expr="$(port_nft "$ports")"
+	name="$(printf '%s' "$name" | tr '|\t\r\n' '    ')"
+	status=unmatched
+	[ -n "$ip" ] && status=active
+
+	case "$strategy" in
+		iid|mask)
+			iid="$(ipv6_iid "$ip" 2>/dev/null)"
+			if [ -n "$iid" ]; then
+				match="ip6 daddr & ::ffff:ffff:ffff:ffff == $iid"
+			else
+				match="ip6 daddr == ::"
+				status=unmatched
+			fi
+			;;
+		*)
+			printf 'set %s { type ipv6_addr; flags interval; }\n' "$setname" >> "$TMP_SCHEMA"
+			if [ -n "$ip" ]; then
+				printf 'set %s { type ipv6_addr; flags interval; elements = { %s } }\n' "$setname" "$ip" >> "$TMP_SETS"
+			else
+				printf 'set %s { type ipv6_addr; flags interval; }\n' "$setname" >> "$TMP_SETS"
+			fi
+			printf '%s\t%s\n' "$setname" "$ip" >> "$TMP_ELEMENTS"
+			match="ip6 daddr @$setname"
+			;;
+	esac
+
+	case "$proto" in
+		tcp) printf '%s %s tcp dport { %s } counter accept comment "ddns-fw:%s"\n' "$RULE_INGRESS" "$match" "$port_expr" "$id" >> "$TMP_FORWARD" ;;
+		udp) printf '%s %s udp dport { %s } counter accept comment "ddns-fw:%s"\n' "$RULE_INGRESS" "$match" "$port_expr" "$id" >> "$TMP_FORWARD" ;;
+		*) printf '%s %s meta l4proto { tcp, udp } th dport { %s } counter accept comment "ddns-fw:%s"\n' "$RULE_INGRESS" "$match" "$port_expr" "$id" >> "$TMP_FORWARD" ;;
+	esac
+	printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$id" "$name" "$source" "$strategy" "$ip" "$proto" "$ports" "$status" >> "$TMP_SNAPSHOT"
+}
+
+collect_config_rule() {
+	local section="$1" enabled name client match_type mac duid static_ip strategy proto ports resolved wh
+	config_get_bool enabled "$section" enabled 1
+	[ "$enabled" = 1 ] || return 0
+	config_get name "$section" name "$section"
+	config_get client "$section" client_name ''
+	config_get match_type "$section" match_type mac
+	config_get mac "$section" mac ''
+	config_get duid "$section" duid ''
+	config_get static_ip "$section" ipv6 ''
+	[ -n "$static_ip" ] || config_get static_ip "$section" ipv6_manual ''
+	config_get strategy "$section" strategy precise
+	config_get proto "$section" proto tcp
+	config_get ports "$section" ports ''
+	proto="$(normalize_proto "$proto" 2>/dev/null)" || { log_msg err "rule=$section invalid protocol"; return 0; }
+	ports="$(normalize_ports "$ports" 2>/dev/null)" || { log_msg err "rule=$section invalid ports"; return 0; }
+
+	case "$match_type" in
+		mac)
+			# When a device has multiple global IPv6 addresses, prefer the
+			# user-selected address saved in option ipv6. Fall back to NDP only
+			# when the user left it empty.
+			if [ -n "$static_ip" ]; then
+				resolved="$static_ip"
+				[ -n "$CURRENT_PREFIX" ] && resolved="$(rebase_ipv6 "$resolved" "$CURRENT_PREFIX")"
+			else
+				resolved="$(resolve_mac "$mac")"
+			fi
+			;;
+		duid) resolved="$(resolve_duid "$duid")" ;;
+		static) resolved="$static_ip" ;;
+		client|hostname) resolved="$(resolve_hostname "$client")" ;;
+		webhook)
+			wh="$(webhook_lookup "$client")"
+			resolved="$(printf '%s' "$wh" | cut -f1)"
+			if [ "$CFG_PAYLOAD_PORTS" = 1 ]; then
+				[ -z "$(printf '%s' "$wh" | cut -f3)" ] || ports="$(printf '%s' "$wh" | cut -f3)"
+				[ -z "$(printf '%s' "$wh" | cut -f2)" ] || proto="$(printf '%s' "$wh" | cut -f2)"
+			fi
+			;;
+		*) resolved="$static_ip" ;;
+	esac
+	valid_ipv6 "$resolved" 2>/dev/null && is_global_ipv6 "$resolved" || resolved=""
+	emit_rule "cfg:$section" "$name" "$match_type" "$strategy" "$resolved" "$proto" "$ports"
+	[ "$match_type" = webhook ] && [ -n "$client" ] && printf '%s\n' "$(safe_id "$client")" >> "$TMP_CLAIMED"
+}
+
+collect_webhooks() {
+	local file client_key client_label ip proto ports stamp id
+	for file in "$WEBHOOK_DIR"/*.tsv; do
+		[ -f "$file" ] || continue
+		client_key="$(basename "$file" .tsv)"
+		client_label="$(cut -f1 "$WEBHOOK_DIR/$client_key.name" 2>/dev/null)"
+		[ -n "$client_label" ] || client_label="$client_key"
+		grep -qx "$client_key" "$TMP_CLAIMED" 2>/dev/null && continue
+		IFS="$(printf '\t')" read -r ip proto ports stamp < "$file"
+		valid_ipv6 "$ip" || continue
+		proto="$(normalize_proto "$proto" 2>/dev/null)" || continue
+		ports="$(normalize_ports "$ports" 2>/dev/null)" || continue
+		emit_rule "webhook:$client_key" "Webhook $client_label" webhook precise "$ip" "$proto" "$ports"
+	done
+}
+
+ensure_fw4_includes() {
+	local changed=0
+	[ "$(uci -q get firewall.ddns_fw_sets.type)" = nftables ] || changed=1
+	[ "$(uci -q get firewall.ddns_fw_sets.path)" = /var/run/ddns-fw/fw4-sets.nft ] || changed=1
+	[ "$(uci -q get firewall.ddns_fw_forward.type)" = nftables ] || changed=1
+	[ "$(uci -q get firewall.ddns_fw_forward.path)" = /var/run/ddns-fw/fw4-forward.nft ] || changed=1
+	[ "$changed" = 0 ] && return 0
+	uci -q delete firewall.ddns_fw_sets
+	uci set firewall.ddns_fw_sets=include
+	uci set firewall.ddns_fw_sets.type=nftables
+	uci set firewall.ddns_fw_sets.path=/var/run/ddns-fw/fw4-sets.nft
+	uci set firewall.ddns_fw_sets.position=table-pre
+	uci set firewall.ddns_fw_sets.enabled=1
+	uci -q delete firewall.ddns_fw_forward
+	uci set firewall.ddns_fw_forward=include
+	uci set firewall.ddns_fw_forward.type=nftables
+	uci set firewall.ddns_fw_forward.path=/var/run/ddns-fw/fw4-forward.nft
+	uci set firewall.ddns_fw_forward.position=chain-pre
+	uci set firewall.ddns_fw_forward.chain=forward
+	uci set firewall.ddns_fw_forward.enabled=1
+	uci commit firewall
+	return 1
+}
+
+prune_nft_sets() {
+	local current="$1" setname
+	nft list table inet fw4 2>/dev/null | sed -n 's/^[[:space:]]*set \(ddns_fw_[0-9a-f]*\) {.*/\1/p' | while read -r setname; do
+		grep -q "^${setname}[[:space:]]" "$current" 2>/dev/null || nft delete set inet fw4 "$setname" >/dev/null 2>&1 || true
+	done
+}
+
+verify_nft_sets() {
+	local current="$1" setname ip
+	nft list table inet fw4 >/dev/null 2>&1 || return 1
+	while IFS="$(printf '\t')" read -r setname ip; do
+		[ -n "$setname" ] || continue
+		nft list set inet fw4 "$setname" >/dev/null 2>&1 || return 1
+	done < "$current"
+	return 0
+}
+
+sync_nft() {
+	local reason="$1" topology old_topology need_reload=0 setname ip state_same=0 ingress_dev lan_dev
+	TMP_SCHEMA=$RUN_DIR/schema.new
+	TMP_SETS=$RUN_DIR/fw4-sets.new
+	TMP_FORWARD=$RUN_DIR/fw4-forward.new
+	TMP_ELEMENTS=$RUN_DIR/elements.new
+	TMP_SNAPSHOT=$RUN_DIR/snapshot.new
+	TMP_CLAIMED=$RUN_DIR/claimed.new
+	: > "$TMP_SCHEMA"; : > "$TMP_SETS"; : > "$TMP_FORWARD"; : > "$TMP_ELEMENTS"; : > "$TMP_SNAPSHOT"; : > "$TMP_CLAIMED"
+	printf '# Managed by ddns-fw. Manual edits are overwritten.\n' >> "$TMP_SETS"
+	printf '# Managed by ddns-fw. Manual edits are overwritten.\n' >> "$TMP_FORWARD"
+	CURRENT_PREFIX="$(wan_prefix)"
+	ingress_dev="$(wan_device)"; lan_dev="$(lan_device)"
+	case "$ingress_dev" in *[!A-Za-z0-9_.:@-]*|'') ingress_dev="";; esac
+	case "$lan_dev" in *[!A-Za-z0-9_.:@-]*|'') lan_dev=br-lan;; esac
+	if [ -n "$ingress_dev" ]; then RULE_INGRESS="iifname \"$ingress_dev\""; else RULE_INGRESS="iifname != \"$lan_dev\""; fi
+
+	config_foreach collect_config_rule rule
+	collect_webhooks
+	topology="$(cat "$TMP_SCHEMA" "$TMP_FORWARD" | md5sum | cut -d' ' -f1)"
+	old_topology="$(cat "$RUN_DIR/topology" 2>/dev/null)"
+	[ "$topology" = "$old_topology" ] || need_reload=1
+	ensure_fw4_includes || need_reload=1
+	cmp -s "$TMP_SNAPSHOT" "$SNAPSHOT" 2>/dev/null && state_same=1
+
+	if [ "$need_reload" = 0 ]; then
+		while IFS="$(printf '\t')" read -r setname ip; do
+			[ -n "$setname" ] || continue
+			nft list set inet fw4 "$setname" >/dev/null 2>&1 || { need_reload=1; break; }
+		done < "$TMP_ELEMENTS"
+	fi
+	if [ "$need_reload" = 0 ] && [ "$state_same" = 1 ]; then
+		prune_nft_sets "$TMP_ELEMENTS"
+		rm -f "$TMP_SCHEMA" "$TMP_ELEMENTS" "$TMP_CLAIMED" "$TMP_SETS" "$TMP_FORWARD" "$TMP_SNAPSHOT"
+		date +%s > "$RUN_DIR/last_sync"
+		return 0
+	fi
+
+	cp "$RUN_DIR/fw4-sets.nft" "$RUN_DIR/fw4-sets.bak" 2>/dev/null || true
+	cp "$RUN_DIR/fw4-forward.nft" "$RUN_DIR/fw4-forward.bak" 2>/dev/null || true
+	mv "$TMP_SETS" "$RUN_DIR/fw4-sets.nft"
+	mv "$TMP_FORWARD" "$RUN_DIR/fw4-forward.nft"
+
+	if [ "$need_reload" = 1 ]; then
+		if fw4 check >/dev/null 2>"$RUN_DIR/fw4-check.err"; then
+			fw4 reload >/dev/null 2>"$RUN_DIR/fw4-reload.err" || true
+		fi
+		if verify_nft_sets "$TMP_ELEMENTS"; then
+			printf '%s\n' "$topology" > "$RUN_DIR/topology"
+			log_msg notice "sync reason=$reason backend=nft action=reload status=ok"
+			prune_nft_sets "$TMP_ELEMENTS"
+		else
+			[ -f "$RUN_DIR/fw4-sets.bak" ] && mv "$RUN_DIR/fw4-sets.bak" "$RUN_DIR/fw4-sets.nft"
+			[ -f "$RUN_DIR/fw4-forward.bak" ] && mv "$RUN_DIR/fw4-forward.bak" "$RUN_DIR/fw4-forward.nft"
+			log_msg err "sync reason=$reason backend=nft action=reload status=failed detail=$(tr '\n' ' ' < "$RUN_DIR/fw4-check.err" | cut -c1-300)"
+			return 1
+		fi
+	else
+		{
+			while IFS="$(printf '\t')" read -r setname ip; do
+				[ -n "$setname" ] || continue
+				printf 'flush set inet fw4 %s\n' "$setname"
+				[ -n "$ip" ] && printf 'add element inet fw4 %s { %s }\n' "$setname" "$ip"
+			done < "$TMP_ELEMENTS"
+		} > "$RUN_DIR/update.nft"
+		if [ -s "$RUN_DIR/update.nft" ] && ! nft -f "$RUN_DIR/update.nft" >/dev/null 2>"$RUN_DIR/nft.err"; then
+			log_msg err "sync reason=$reason backend=nft action=hot-update status=failed detail=$(tr '\n' ' ' < "$RUN_DIR/nft.err" | cut -c1-300)"
+			return 1
+		fi
+		log_msg notice "sync reason=$reason backend=nft action=hot-update status=ok"
+	fi
+	mv "$TMP_SNAPSHOT" "$SNAPSHOT"
+	mv "$TMP_ELEMENTS" "$RUN_DIR/elements.tsv"
+	rm -f "$TMP_SCHEMA" "$TMP_CLAIMED" "$RUN_DIR/fw4-sets.bak" "$RUN_DIR/fw4-forward.bak"
+	date +%s > "$RUN_DIR/last_sync"
+	return 0
+}
+
+delete_uci_rules() {
+	local section
+	uci -q show firewall | sed -n 's/^firewall\.\(ddns_fw_[A-Za-z0-9_]*\)=rule$/\1/p' | while read -r section; do
+		uci -q delete "firewall.$section"
+	done
+}
+
+uci_emit_from_snapshot() {
+	local id name source strategy ip proto ports status section mask
+	while IFS='|' read -r id name source strategy ip proto ports status; do
+		[ "$status" = active ] || continue
+		section="${PREFIX}${id}"
+		uci set "firewall.$section=rule"
+		uci set "firewall.$section.name=ddns_fw_$id"
+		uci set "firewall.$section.family=ipv6"
+		uci set "firewall.$section.src=wan"
+		uci set "firewall.$section.dest=lan"
+		uci set "firewall.$section.target=ACCEPT"
+		uci set "firewall.$section.proto=$( [ "$proto" = tcpudp ] && echo 'tcp udp' || echo "$proto" )"
+		uci set "firewall.$section.dest_port=$ports"
+		if [ "$strategy" = iid ] || [ "$strategy" = mask ]; then
+			mask="$(ipv6_iid "$ip")"
+			uci set "firewall.$section.dest_ip=$mask/::ffff:ffff:ffff:ffff"
+		else
+			uci set "firewall.$section.dest_ip=$ip"
+		fi
+	done < "$TMP_SNAPSHOT"
+}
+
+sync_uci() {
+	local reason="$1"
+	TMP_SCHEMA=$RUN_DIR/schema.new; TMP_SETS=$RUN_DIR/unused-sets.new; TMP_FORWARD=$RUN_DIR/unused-forward.new
+	TMP_ELEMENTS=$RUN_DIR/unused-elements.new; TMP_SNAPSHOT=$RUN_DIR/snapshot.new; TMP_CLAIMED=$RUN_DIR/claimed.new
+	: > "$TMP_SCHEMA"; : > "$TMP_SETS"; : > "$TMP_FORWARD"; : > "$TMP_ELEMENTS"; : > "$TMP_SNAPSHOT"; : > "$TMP_CLAIMED"
+	CURRENT_PREFIX="$(wan_prefix)"
+	config_foreach collect_config_rule rule
+	collect_webhooks
+	delete_uci_rules
+	uci_emit_from_snapshot
+	uci commit firewall
+	if /etc/init.d/firewall reload >/dev/null 2>&1; then
+		mv "$TMP_SNAPSHOT" "$SNAPSHOT"
+		date +%s > "$RUN_DIR/last_sync"
+		log_msg notice "sync reason=$reason backend=uci action=reload status=ok"
+		return 0
+	fi
+	log_msg err "sync reason=$reason backend=uci action=reload status=failed"
+	return 1
+}
+
+do_sync() {
+	local reason="${1:-manual}" be
+	[ -d "$RUN_DIR/lock" ] && return 0
+	mkdir "$RUN_DIR/lock" 2>/dev/null || return 0
+	trap 'rmdir "$RUN_DIR/lock" 2>/dev/null' EXIT TERM INT
+	cfg_load
+	[ "$CFG_ENABLED" = 1 ] || { rmdir "$RUN_DIR/lock"; trap - EXIT; return 0; }
+	be="$(backend)"
+	if [ "$be" = nft ]; then sync_nft "$reason"; else sync_uci "$reason"; fi
+	local rc=$?
+	rmdir "$RUN_DIR/lock" 2>/dev/null
+	trap - EXIT TERM INT
+	return "$rc"
+}
+
+do_webhook() {
+	local body="$1" remote="${2:-unknown}" client ip proto ports raw_ports stamp file
+	client="$(jsonfilter -s "$body" -e '@.client_name' 2>/dev/null)"
+	ip="$(jsonfilter -s "$body" -e '@.ipv6' 2>/dev/null)"
+	proto="$(jsonfilter -s "$body" -e '@.protocol' 2>/dev/null)"
+	[ -n "$proto" ] || proto="$(jsonfilter -s "$body" -e '@.proto' 2>/dev/null)"
+	[ -n "$proto" ] || proto=tcp
+	raw_ports="$(jsonfilter -s "$body" -e '@.ports[*]' 2>/dev/null)"
+	[ -n "$raw_ports" ] || raw_ports="$(jsonfilter -s "$body" -e '@.ports' 2>/dev/null)"
+
+	valid_client "$client" || { printf '{"ok":false,"error":"invalid client_name"}\n'; return 2; }
+	valid_ipv6 "$ip" || { printf '{"ok":false,"error":"invalid public IPv6"}\n'; return 2; }
+	is_global_ipv6 "$ip" || { printf '{"ok":false,"error":"IPv6 must be globally routable"}\n'; return 2; }
+	proto="$(normalize_proto "$proto" 2>/dev/null)" || { printf '{"ok":false,"error":"protocol must be tcp, udp, or tcpudp"}\n'; return 2; }
+	ports="$(normalize_ports "$raw_ports" 2>/dev/null)" || { printf '{"ok":false,"error":"ports must contain valid ports or ranges"}\n'; return 2; }
+	cfg_load
+	[ "$CFG_PAYLOAD_PORTS" = 1 ] || {
+		printf '{"ok":false,"error":"payload-controlled ports are disabled"}\n'
+		return 2
+	}
+	stamp="$(date +%s)"
+	file="$WEBHOOK_DIR/$(safe_id "$client").tsv"
+	printf '%s\t%s\t%s\t%s\n' "$ip" "$proto" "$ports" "$stamp" > "$file.new"
+	mv "$file.new" "$file"
+	printf '%s\t%s\n' "$client" "$(safe_id "$client")" > "$WEBHOOK_DIR/$(safe_id "$client").name"
+	log_msg notice "webhook remote=$remote client=$client ipv6=$ip proto=$proto ports=$ports status=accepted"
+	if do_sync "webhook:$client"; then
+		printf '{"ok":true,"client_name":"%s","ipv6":"%s","protocol":"%s","ports":"%s"}\n' \
+			"$(json_quote "$client")" "$(json_quote "$ip")" "$proto" "$(json_quote "$ports")"
+		return 0
+	fi
+	printf '{"ok":false,"error":"firewall synchronization failed"}\n'
+	return 3
+}
+
+do_status() {
+	local be prefix last enabled api_port api_enabled count active pid service_state id name source strategy ip proto ports state fwver luciver
+	cfg_load
+	be="$(backend)"; prefix="$(wan_prefix)"; last="$(cat "$RUN_DIR/last_sync" 2>/dev/null)"
+	fwver="$(fw4 --version 2>/dev/null | head -1)"
+	[ -n "$fwver" ] || fwver="firewall3"
+	luciver="$(opkg status luci-base 2>/dev/null | sed -n 's/^Version: //p' | head -1)"
+	config_get api_port main api_port 9080
+	config_get_bool api_enabled main api_enabled 1
+	if [ -r "$SNAPSHOT" ]; then count="$(wc -l < "$SNAPSHOT")"; else count=0; fi
+	active="$(awk -F '|' '$8=="active"{n++} END{print n+0}' "$SNAPSHOT" 2>/dev/null)"
+	pidof ddns-fw-daemon >/dev/null 2>&1 && service_state=running || service_state=stopped
+	json_init
+	json_add_boolean enabled "$CFG_ENABLED"
+	json_add_string backend "$be"
+	json_add_string firewall_version "$fwver"
+	json_add_string luci_version "$luciver"
+	json_add_string service "$service_state"
+	json_add_string wan_prefix "$prefix"
+	json_add_int last_sync "${last:-0}"
+	json_add_int rule_count "${count:-0}"
+	json_add_int active_count "${active:-0}"
+	json_add_boolean api_enabled "$api_enabled"
+	json_add_int api_port "${api_port:-9080}"
+	json_add_array rules
+	while IFS='|' read -r id name source strategy ip proto ports state; do
+		[ -n "$id" ] || continue
+		json_add_object ''
+		json_add_string id "$id"; json_add_string name "$name"; json_add_string source "$source"
+		json_add_string strategy "$strategy"; json_add_string ipv6 "$ip"; json_add_string protocol "$proto"
+		json_add_string ports "$ports"; json_add_string status "$state"
+		json_close_object
+	done < "$SNAPSHOT" 2>/dev/null
+	json_close_array
+	json_dump
+}
+
+do_devices() {
+	local dev ip mac state host devices_tmp macs_tmp group_tmp first_host first_state first_ip first=1 ip_first
+	cfg_load; dev="$(lan_device)"
+	devices_tmp="$RUN_DIR/devices.$$"
+	ip -6 neigh show dev "$dev" 2>/dev/null | awk '
+	$1 ~ /^[23]/ && $2 == "lladdr" && $4 != "FAILED" {
+		key=$1 "|" tolower($3)
+		if (!seen[key]++) print $1 "|" $3 "|" $4
+	}' > "$devices_tmp"
+	macs_tmp="$RUN_DIR/macs.$$"
+	awk -F'|' '{ if (!seen[tolower($2)]++) print $2 }' "$devices_tmp" > "$macs_tmp"
+	printf '{"interface":"%s","devices":[' "$(json_quote "$dev")"
+	while IFS= read -r mac; do
+		[ -n "$mac" ] || continue
+		first_ip="$(awk -F'|' -v m="$mac" 'tolower($2)==tolower(m){print $1; exit}' "$devices_tmp")"
+		first_state="$(awk -F'|' -v m="$mac" 'tolower($2)==tolower(m){print $3; exit}' "$devices_tmp")"
+		first_host="$(awk -v a="$first_ip" '$1==a {print $2; exit}' /tmp/hosts/odhcpd 2>/dev/null)"
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"mac":"%s","hostname":"%s","state":"%s","ipv6s":[' "$(json_quote "$mac")" "$(json_quote "$first_host")" "$(json_quote "$first_state")"
+		ip_first=1
+		group_tmp="$RUN_DIR/group.$$"
+		awk -F'|' -v m="$mac" 'tolower($2)==tolower(m){print $1 "|" $3}' "$devices_tmp" > "$group_tmp"
+		while IFS='|' read -r ip state; do
+			[ -n "$ip" ] || continue
+			[ "$ip_first" = 1 ] || printf ','
+			ip_first=0
+			printf '{"address":"%s","state":"%s"}' "$(json_quote "$ip")" "$(json_quote "$state")"
+		done < "$group_tmp"
+		rm -f "$group_tmp"
+		printf ']}'
+	done < "$macs_tmp"
+	printf ']}\n'
+	rm -f "$devices_tmp"
+	rm -f "$macs_tmp"
+}
+
+do_logs() {
+	local limit="$1" line logs_tmp
+	case "$limit" in ''|*[!0-9]*) limit=100;; esac
+	[ "$limit" -le 500 ] || limit=500
+	logs_tmp="$RUN_DIR/logs.$$"
+	tail -n "$limit" "$LOG_FILE" 2>/dev/null > "$logs_tmp"
+	json_init; json_add_array entries
+	while IFS= read -r line; do json_add_string '' "$line"; done < "$logs_tmp"
+	rm -f "$logs_tmp"
+	json_close_array; json_dump
+}
+
+cleanup() {
+	local be setname ip
+	be="$(backend)"
+	if [ "$be" = nft ]; then
+		printf '# ddns-fw stopped\n' > "$RUN_DIR/fw4-sets.nft"
+		printf '# ddns-fw stopped\n' > "$RUN_DIR/fw4-forward.nft"
+		fw4 reload >/dev/null 2>&1 || true
+		: > "$RUN_DIR/empty-elements"
+		prune_nft_sets "$RUN_DIR/empty-elements"
+		rm -f "$RUN_DIR/empty-elements" "$RUN_DIR/topology" "$SNAPSHOT" "$RUN_DIR/elements.tsv"
+	else
+		delete_uci_rules; uci commit firewall; /etc/init.d/firewall reload >/dev/null 2>&1
+	fi
+}
+
+case "$1" in
+	sync) shift; do_sync "$@" ;;
+	webhook) shift; do_webhook "$@" ;;
+	status) do_status ;;
+	devices) do_devices ;;
+	logs) do_logs "${2:-100}" ;;
+	log) shift; log_msg "$@" ;;
+	cleanup) cleanup ;;
+	*) echo "Usage: ddns-fw {sync|webhook|status|devices|logs|log|cleanup}" >&2; exit 2 ;;
+esac

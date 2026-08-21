@@ -1,0 +1,39 @@
+#!/bin/sh
+
+uci -q get ddns_fw.main >/dev/null || uci set ddns_fw.main=global
+uci -q get ddns_fw.main.token >/dev/null || uci set ddns_fw.main.token=''
+
+token="$(uci -q get ddns_fw.main.token)"
+if [ -z "$token" ]; then
+	token="$(hexdump -n 24 -e '24/1 "%02x"' /dev/urandom 2>/dev/null)"
+	[ -n "$token" ] || token="$(date +%s)-$(head -c 32 /dev/urandom | md5sum | cut -d' ' -f1)"
+	uci set ddns_fw.main.token="$token"
+fi
+uci commit ddns_fw
+
+if command -v fw4 >/dev/null 2>&1; then
+	uci -q delete firewall.ddns_fw_sets
+	uci set firewall.ddns_fw_sets=include
+	uci set firewall.ddns_fw_sets.type=nftables
+	uci set firewall.ddns_fw_sets.path=/var/run/ddns-fw/fw4-sets.nft
+	uci set firewall.ddns_fw_sets.position=table-pre
+	uci set firewall.ddns_fw_sets.enabled=1
+
+	uci -q delete firewall.ddns_fw_forward
+	uci set firewall.ddns_fw_forward=include
+	uci set firewall.ddns_fw_forward.type=nftables
+	uci set firewall.ddns_fw_forward.path=/var/run/ddns-fw/fw4-forward.nft
+	uci set firewall.ddns_fw_forward.position=chain-pre
+	uci set firewall.ddns_fw_forward.chain=forward
+	uci set firewall.ddns_fw_forward.enabled=1
+	uci commit firewall
+fi
+
+mkdir -p /var/run/ddns-fw /var/log
+: > /var/run/ddns-fw/fw4-sets.nft
+: > /var/run/ddns-fw/fw4-forward.nft
+
+/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+/etc/init.d/ddns-fw enable
+/etc/init.d/ddns-fw restart >/dev/null 2>&1 || true
+exit 0

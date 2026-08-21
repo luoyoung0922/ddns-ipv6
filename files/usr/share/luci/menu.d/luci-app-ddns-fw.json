@@ -1,0 +1,62 @@
+{
+  "admin/network/ddns-fw": {
+    "title": "DDNS IPv6 防火墙",
+    "order": 58,
+    "action": { "type": "firstchild" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/network/ddns-fw/overview": {
+    "title": "状态概览",
+    "order": 1,
+    "action": { "type": "view", "path": "ddns-fw/dashboard" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/network/ddns-fw/rules": {
+    "title": "规则与设备",
+    "order": 10,
+    "action": { "type": "view", "path": "ddns-fw/rules" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/network/ddns-fw/webhook": {
+    "title": "Webhook / 接入",
+    "order": 20,
+    "action": { "type": "view", "path": "ddns-fw/webhook" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/network/ddns-fw/logs": {
+    "title": "审计日志",
+    "order": 30,
+    "action": { "type": "view", "path": "ddns-fw/logs" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/services/ddns-fw": {
+    "title": "DDNS IPv6 防火墙",
+    "order": 58,
+    "action": { "type": "firstchild" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/services/ddns-fw/overview": {
+    "title": "状态概览",
+    "order": 1,
+    "action": { "type": "view", "path": "ddns-fw/dashboard" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/services/ddns-fw/rules": {
+    "title": "规则与设备",
+    "order": 10,
+    "action": { "type": "view", "path": "ddns-fw/rules" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/services/ddns-fw/webhook": {
+    "title": "Webhook / 接入",
+    "order": 20,
+    "action": { "type": "view", "path": "ddns-fw/webhook" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  },
+  "admin/services/ddns-fw/logs": {
+    "title": "审计日志",
+    "order": 30,
+    "action": { "type": "view", "path": "ddns-fw/logs" },
+    "depends": { "acl": [ "luci-app-ddns-fw" ] }
+  }
+}

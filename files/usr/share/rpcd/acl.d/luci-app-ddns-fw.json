@@ -1,0 +1,13 @@
+{
+	"luci-app-ddns-fw": {
+		"description": "Grant access to Dynamic IPv6 Firewall",
+		"read": {
+			"ubus": { "ddns_fw": [ "status", "devices", "logs" ] },
+			"uci": [ "ddns_fw" ]
+		},
+		"write": {
+			"ubus": { "ddns_fw": [ "sync", "test_webhook" ] },
+			"uci": [ "ddns_fw" ]
+		}
+	}
+}

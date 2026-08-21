@@ -1,0 +1,17 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+trap 'exit 0' TERM INT
+
+last_signature=""
+while :; do
+	config_load ddns_fw
+	config_get_bool enabled main enabled 1
+	config_get interval main refresh_interval 30
+	[ "$enabled" = 1 ] && /usr/sbin/ddns-fw sync daemon >/dev/null 2>&1
+	case "$interval" in ''|*[!0-9]*) interval=30;; esac
+	[ "$interval" -ge 5 ] 2>/dev/null || interval=5
+	sleep "$interval" &
+	wait $!
+done

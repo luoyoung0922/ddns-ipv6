@@ -1,0 +1,4 @@
+#!/bin/sh
+
+[ "$ACTION" = add ] || [ "$ACTION" = change ] || exit 0
+( sleep 1; /usr/sbin/ddns-fw sync "neigh:${ACTION}" >/dev/null 2>&1 ) &

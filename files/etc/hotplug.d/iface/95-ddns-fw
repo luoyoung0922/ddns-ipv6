@@ -1,0 +1,13 @@
+#!/bin/sh
+
+[ "$ACTION" = ifup ] || [ "$ACTION" = reload ] || [ "$ACTION" = ifupdate ] || exit 0
+
+. /lib/functions.sh
+config_load ddns_fw
+config_get_bool enabled main enabled 1
+config_get wan main wan_interface wan6
+config_get lan main lan_interface lan
+[ "$enabled" = 1 ] || exit 0
+[ "$INTERFACE" = "$wan" ] || [ "$INTERFACE" = "$lan" ] || exit 0
+
+( sleep 2; /usr/sbin/ddns-fw sync "hotplug:${INTERFACE}:${ACTION}" >/dev/null 2>&1 ) &

@@ -1,0 +1,28 @@
+#!/bin/sh
+
+case "$1" in
+	list)
+		cat <<'EOF'
+{"status":{},"devices":{},"logs":{"limit":0},"sync":{},"test_webhook":{"client_name":"","ipv6":"","ports":""}}
+EOF
+		;;
+	call)
+		case "$2" in
+			status) exec /usr/sbin/ddns-fw status ;;
+			devices) exec /usr/sbin/ddns-fw devices ;;
+			logs)
+				read -r input
+				limit="$(jsonfilter -s "$input" -e '@.limit' 2>/dev/null)"
+				exec /usr/sbin/ddns-fw logs "${limit:-100}"
+				;;
+			sync)
+				/usr/sbin/ddns-fw sync luci >/dev/null 2>&1
+				exec /usr/sbin/ddns-fw status
+				;;
+			test_webhook)
+				read -r input
+				exec /usr/sbin/ddns-fw webhook "$input" luci-test
+				;;
+		esac
+		;;
+esac
