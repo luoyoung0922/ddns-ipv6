@@ -3,7 +3,7 @@
 case "$1" in
 	list)
 		cat <<'EOF'
-{"status":{},"devices":{},"logs":{"limit":0},"sync":{},"test_webhook":{"client_name":"","ipv6":"","ports":""}}
+{"status":{},"devices":{},"logs":{"limit":0},"sync":{},"set_active":{"enabled":false,"interval":0},"test_webhook":{"client_name":"","ipv6":"","ports":""}}
 EOF
 		;;
 	call)
@@ -17,6 +17,18 @@ EOF
 				;;
 			sync)
 				/usr/sbin/ddns-fw sync luci >/dev/null 2>&1
+				exec /usr/sbin/ddns-fw status
+				;;
+			set_active)
+				read -r input
+				enabled="$(jsonfilter -s "$input" -e '@.enabled' 2>/dev/null)"
+				interval="$(jsonfilter -s "$input" -e '@.interval' 2>/dev/null)"
+				case "$enabled" in true|1) enabled=1;; *) enabled=0;; esac
+				case "$interval" in 5|10|15|30|60|120|300) ;; *) interval=30;; esac
+				uci set ddns_fw.main.active_enabled="$enabled"
+				uci set ddns_fw.main.refresh_interval="$interval"
+				uci commit ddns_fw
+				/etc/init.d/ddns-fw restart >/dev/null 2>&1
 				exec /usr/sbin/ddns-fw status
 				;;
 			test_webhook)

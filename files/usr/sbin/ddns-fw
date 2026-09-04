@@ -524,7 +524,7 @@ do_webhook() {
 }
 
 do_status() {
-	local be prefix last enabled api_port api_enabled count active pid service_state id name source strategy ip proto ports state fwver luciver
+	local be prefix last enabled active_enabled refresh_interval api_port api_enabled count active pid service_state id name source strategy ip proto ports state fwver luciver
 	cfg_load
 	be="$(backend)"; prefix="$(wan_prefix)"; last="$(cat "$RUN_DIR/last_sync" 2>/dev/null)"
 	fwver="$(fw4 --version 2>/dev/null | head -1)"
@@ -532,11 +532,15 @@ do_status() {
 	luciver="$(opkg status luci-base 2>/dev/null | sed -n 's/^Version: //p' | head -1)"
 	config_get api_port main api_port 9080
 	config_get_bool api_enabled main api_enabled 1
+	config_get_bool active_enabled main active_enabled 1
+	config_get refresh_interval main refresh_interval 30
 	if [ -r "$SNAPSHOT" ]; then count="$(wc -l < "$SNAPSHOT")"; else count=0; fi
 	active="$(awk -F '|' '$8=="active"{n++} END{print n+0}' "$SNAPSHOT" 2>/dev/null)"
 	pidof ddns-fw-daemon >/dev/null 2>&1 && service_state=running || service_state=stopped
 	json_init
 	json_add_boolean enabled "$CFG_ENABLED"
+	json_add_boolean active_enabled "$active_enabled"
+	json_add_int refresh_interval "${refresh_interval:-30}"
 	json_add_string backend "$be"
 	json_add_string firewall_version "$fwver"
 	json_add_string luci_version "$luciver"

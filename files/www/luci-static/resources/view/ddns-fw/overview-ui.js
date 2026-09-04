@@ -5,6 +5,7 @@
 
 var callStatus = rpc.declare({ object: "ddns_fw", method: "status", expect: {} });
 var callSync = rpc.declare({ object: "ddns_fw", method: "sync", expect: {} });
+var callSetActive = rpc.declare({ object: "ddns_fw", method: "set_active", params: ["enabled", "interval"], expect: {} });
 
 function text(s) { return String(s == null ? "—" : s); }
 
@@ -13,6 +14,10 @@ return view.extend({
   render: function(s) {
     var self = this;
     var active = Number(s.active_count || 0), total = Number(s.rule_count || 0);
+    var activeToggle = E("input", { "type": "checkbox", "checked": s.active_enabled !== false });
+    var intervalSelect = E("select", { "class": "cbi-input-select" }, [5, 10, 15, 30, 60, 120, 300].map(function(seconds) {
+      return E("option", { "value": String(seconds), "selected": Number(s.refresh_interval || 30) === seconds }, seconds + " 秒");
+    }));
     var ruleRows = (s.rules || []).map(function(r) {
       var isActive = r.status === "active";
       return E("tr", {}, [
@@ -43,6 +48,20 @@ return view.extend({
         E("div", { "class": "ddns-fw-card" }, [E("span", { "class": "ddns-fw-muted" }, "生效规则"), E("strong", { "class": active ? "ddns-fw-ok" : "ddns-fw-warn" }, active + " / " + total + " 条")]),
         E("div", { "class": "ddns-fw-card" }, [E("span", { "class": "ddns-fw-muted" }, "Webhook"), E("strong", {}, s.api_enabled ? ":" + text(s.api_port) : "关闭")]),
         E("div", { "class": "ddns-fw-card" }, [E("span", { "class": "ddns-fw-muted" }, "最近同步"), E("strong", {}, s.last_sync ? new Date(Number(s.last_sync) * 1000).toLocaleString() : "暂无")])
+      ]),
+      E("style", {}, ".ddns-fw-active-box{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:17px 19px;margin-bottom:18px;border:1px solid #bcc8d6;border-radius:13px;background:#fff;color:#172b4d;box-shadow:0 5px 16px rgba(32,56,85,.07)}.ddns-fw-active-copy{display:flex;align-items:center;gap:13px}.ddns-fw-active-icon{display:flex;width:38px;height:38px;align-items:center;justify-content:center;border-radius:11px;background:#dff8f1;color:#067a63;font-size:20px}.ddns-fw-active-copy strong{display:block;color:#172b4d;font-size:15px}.ddns-fw-active-copy span{display:block;margin-top:4px;color:#3f5873;font-size:12px}.ddns-fw-active-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.ddns-fw-switch{display:flex;align-items:center;gap:7px;color:#304b68;font-size:13px}.ddns-fw-active-controls select{min-width:94px}.ddns-fw-active-save{border-radius:8px!important;padding:8px 14px!important}@media(max-width:700px){.ddns-fw-active-box{align-items:flex-start;flex-direction:column}.ddns-fw-active-controls{width:100%}}"),
+      E("div", { "class": "ddns-fw-active-box" }, [
+        E("div", { "class": "ddns-fw-active-copy" }, [E("span", { "class": "ddns-fw-active-icon" }, "⌁"), E("div", {}, [E("strong", {}, "主动监听"), E("span", {}, "自动检查 WAN6、NDP 与 DHCPv6 地址变化；关闭后 Webhook 仍可独立工作。")])]),
+        E("div", { "class": "ddns-fw-active-controls" }, [
+          E("label", { "class": "ddns-fw-switch" }, [activeToggle, E("span", {}, s.active_enabled !== false ? "已开启" : "已关闭")]),
+          intervalSelect,
+          E("button", { "class": "cbi-button cbi-button-positive ddns-fw-active-save", "click": ui.createHandlerFn(self, function() {
+            return callSetActive(activeToggle.checked, Number(intervalSelect.value)).then(function() {
+              ui.addNotification(null, E("p", {}, "主动监听设置已保存"), "info");
+              window.location.reload();
+            });
+          }) }, "保存设置")
+        ])
       ]),
       E("div", { "class": "ddns-fw-panel" }, [E("div", { "class": "ddns-fw-panel-head" }, [E("h3", {}, "当前规则"), E("span", {}, total ? active + " 条已生效" : "暂无规则")]), ruleRows.length ? E("div", { "class": "ddns-fw-table-wrap" }, E("table", { "class": "ddns-fw-table" }, [E("thead", {}, E("tr", {}, [E("th", {}, "规则"), E("th", {}, "当前公网 IPv6"), E("th", {}, "协议 / 端口"), E("th", {}, "状态")])) , E("tbody", {}, ruleRows)])) : E("div", { "class": "ddns-fw-empty" }, "尚未添加规则，前往“规则与设备”创建第一条规则。")]),
       E("div", { "class": "ddns-fw-panel" }, [E("div", { "class": "ddns-fw-panel-head" }, [E("h3", {}, "运行提示"), E("span", {}, "自动同步已开启")]), E("div", { "class": "ddns-fw-hint" }, "主动模式会轮询 NDP / DHCPv6；Webhook 使用 Authorization: Bearer Token。地址变化走 nft 原子热更新，只有规则拓扑变化才会 reload 防火墙。")])
