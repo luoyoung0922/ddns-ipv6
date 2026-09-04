@@ -8,7 +8,7 @@
   "admin/network/ddns-fw/overview": {
     "title": "状态概览",
     "order": 1,
-    "action": { "type": "view", "path": "ddns-fw/overview-ui" },
+    "action": { "type": "view", "path": "ddns-fw/overview-ui-v2" },
     "depends": { "acl": [ "luci-app-ddns-fw" ] }
   },
   "admin/network/ddns-fw/rules": {
@@ -38,7 +38,7 @@
   "admin/services/ddns-fw/overview": {
     "title": "状态概览",
     "order": 1,
-    "action": { "type": "view", "path": "ddns-fw/overview-ui" },
+    "action": { "type": "view", "path": "ddns-fw/overview-ui-v2" },
     "depends": { "acl": [ "luci-app-ddns-fw" ] }
   },
   "admin/services/ddns-fw/rules": {
@@ -60,3 +60,4 @@
     "depends": { "acl": [ "luci-app-ddns-fw" ] }
   }
 }
+
