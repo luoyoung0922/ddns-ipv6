@@ -6,7 +6,7 @@
 			"uci": [ "ddns_fw" ]
 		},
 		"write": {
-			"ubus": { "ddns_fw": [ "sync", "set_active", "test_webhook" ] },
+			"ubus": { "ddns_fw": [ "sync", "set_master", "set_active", "test_webhook" ] },
 			"uci": [ "ddns_fw" ]
 		}
 	}
