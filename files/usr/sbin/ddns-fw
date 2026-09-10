@@ -524,7 +524,7 @@ do_webhook() {
 }
 
 do_status() {
-	local be prefix last enabled active_enabled refresh_interval api_port api_enabled count active pid service_state id name source strategy ip proto ports state fwver luciver
+	local be prefix last enabled active_enabled refresh_interval api_port api_enabled api_running daemon_running count active pid service_state id name source strategy ip proto ports state fwver luciver
 	cfg_load
 	be="$(backend)"; prefix="$(wan_prefix)"; last="$(cat "$RUN_DIR/last_sync" 2>/dev/null)"
 	fwver="$(fw4 --version 2>/dev/null | head -1)"
@@ -536,10 +536,13 @@ do_status() {
 	config_get refresh_interval main refresh_interval 30
 	if [ -r "$SNAPSHOT" ]; then count="$(wc -l < "$SNAPSHOT")"; else count=0; fi
 	active="$(awk -F '|' '$8=="active"{n++} END{print n+0}' "$SNAPSHOT" 2>/dev/null)"
-	pidof ddns-fw-daemon >/dev/null 2>&1 && service_state=running || service_state=stopped
+	pidof ddns-fw-daemon >/dev/null 2>&1 && daemon_running=1 || daemon_running=0
+	ps w 2>/dev/null | grep -q '[u]httpd.*ddns-fw-api' && api_running=1 || api_running=0
+	[ "$daemon_running" = 1 ] || [ "$api_running" = 1 ] && service_state=running || service_state=stopped
 	json_init
 	json_add_boolean enabled "$CFG_ENABLED"
 	json_add_boolean active_enabled "$active_enabled"
+	json_add_boolean active_running "$daemon_running"
 	json_add_int refresh_interval "${refresh_interval:-30}"
 	json_add_string backend "$be"
 	json_add_string firewall_version "$fwver"
@@ -550,6 +553,7 @@ do_status() {
 	json_add_int rule_count "${count:-0}"
 	json_add_int active_count "${active:-0}"
 	json_add_boolean api_enabled "$api_enabled"
+	json_add_boolean api_running "$api_running"
 	json_add_int api_port "${api_port:-9080}"
 	json_add_array rules
 	while IFS='|' read -r id name source strategy ip proto ports state; do
@@ -619,6 +623,9 @@ cleanup() {
 	if [ "$be" = nft ]; then
 		printf '# ddns-fw stopped\n' > "$RUN_DIR/fw4-sets.nft"
 		printf '# ddns-fw stopped\n' > "$RUN_DIR/fw4-forward.nft"
+		uci -q delete firewall.ddns_fw_sets
+		uci -q delete firewall.ddns_fw_forward
+		uci commit firewall
 		fw4 reload >/dev/null 2>&1 || true
 		: > "$RUN_DIR/empty-elements"
 		prune_nft_sets "$RUN_DIR/empty-elements"
